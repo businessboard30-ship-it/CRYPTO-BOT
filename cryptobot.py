@@ -467,13 +467,6 @@ async def main():
     # Scheduled jobs
     interval = random.choice(AUTO_POST_INTERVALS)
     app.job_queue.run_repeating(auto_post_job, interval=timedelta(minutes=interval))
-    
-    logging.info("🚀 CryptoBot starting...")
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
 # ════════════════════════════════════════════════════════════════════════════════
 # PREMIUM & MONETIZATION
 # ════════════════════════════════════════════════════════════════════════════════
@@ -757,3 +750,31 @@ async def handle_message_extended(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+def main():
+    """Start the bot."""
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(handle_callback_extended))
+    
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_extended))
+    
+    # Chat membership
+    app.add_handler(ChatMemberHandler(track_chat_membership, ChatMemberHandler.MY_CHAT_MEMBER))
+    
+    # Scheduled jobs
+    interval = random.choice(AUTO_POST_INTERVALS)
+    app.job_queue.run_repeating(auto_post_job, interval=timedelta(minutes=interval))
+    
+    logging.info("🚀 CryptoBot starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
