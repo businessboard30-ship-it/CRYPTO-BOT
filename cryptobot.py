@@ -46,7 +46,7 @@ CHANNELS_FILE = os.path.join(DATA_DIR, "channels.json")
 LEADERBOARD_FILE = os.path.join(DATA_DIR, "leaderboard.json")
 
 PREMIUM_PRICE = 50.0
-AUTO_POST_INTERVALS = [10, 15, 25, 35]
+AUTO_POST_INTERVALS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 WHITELISTED_DOMAINS = {
     "binance.com", "coinbase.com", "kraken.com", "kucoin.com",
