@@ -13,6 +13,8 @@ import json
 import logging
 import random
 import io
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -149,35 +151,107 @@ async def get_crypto_price(symbol: str) -> Dict:
         pass
     return None
 
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags/entities from RSS description text."""
+    text = re.sub(r"<[^>]+>", "", text or "")
+    text = text.replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", '"')
+    return text.strip()
+
+
+def safe_md(text: str) -> str:
+    """Escape characters that break Telegram's legacy Markdown parser.
+    Coin names and especially news headlines from external sources often
+    contain *, _, `, or [ which otherwise cause send_message to fail with
+    'can't parse entities' and silently drop the whole post.
+    """
+    if text is None:
+        return ""
+    text = str(text)
+    for ch in ("*", "_", "`", "["):
+        text = text.replace(ch, "")
+    return text
+
+
+async def _fetch_rss_titles(client: httpx.AsyncClient, url: str, source_name: str, limit: int = 6) -> List[Dict]:
+    """Generic RSS/Atom feed title fetcher. Returns [] on any failure."""
+    out = []
+    try:
+        r = await client.get(url)
+        if r.status_code != 200:
+            return out
+        root = ET.fromstring(r.content)
+        # Standard RSS 2.0: channel/item/title
+        items = root.findall(".//item")
+        if not items:
+            # Atom fallback: feed/entry/title
+            items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+        for item in items[:limit]:
+            title_el = item.find("title")
+            if title_el is None:
+                title_el = item.find("{http://www.w3.org/2005/Atom}title")
+            if title_el is not None and title_el.text:
+                out.append({"title": _strip_html(title_el.text)[:140], "source": source_name})
+    except Exception as e:
+        logging.warning(f"{source_name} RSS failed: {e}")
+    return out
+
+
 async def get_crypto_news():
     """Get crypto news from multiple sources, falling back if one fails.
+    Tries sources in order and stops once we have enough headlines.
     Returns a list of dicts: {"title": str, "source": str}
     """
-    results = []
+    results: List[Dict] = []
 
-    # Source 1: CryptoCompare news (free, no key required, generous rate limit)
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "cryptobot/1.0"}) as c:
+
+        # Source 1: CryptoCompare news (free, no key required, generous rate limit)
+        try:
             r = await c.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
             if r.status_code == 200:
                 data = r.json()
                 for item in data.get("Data", [])[:6]:
                     title = item.get("title")
                     if title:
-                        results.append({"title": title.strip(), "source": item.get("source_info", {}).get("name") or item.get("source", "CryptoCompare")})
-    except Exception as e:
-        logging.warning(f"CryptoCompare news failed: {e}")
+                        results.append({
+                            "title": title.strip(),
+                            "source": item.get("source_info", {}).get("name") or item.get("source", "CryptoCompare")
+                        })
+        except Exception as e:
+            logging.warning(f"CryptoCompare news failed: {e}")
 
-    if len(results) >= 3:
-        return results[:5]
+        if len(results) >= 3:
+            return results[:5]
 
-    # Source 2: CoinGecko status updates (free, no key required)
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                "https://api.coingecko.com/api/v3/status_updates",
-                params={"per_page": 6}
-            )
+        # Source 2: CoinDesk RSS
+        results += await _fetch_rss_titles(c, "https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk")
+        if len(results) >= 3:
+            return results[:5]
+
+        # Source 3: CoinTelegraph RSS
+        results += await _fetch_rss_titles(c, "https://cointelegraph.com/rss", "Cointelegraph")
+        if len(results) >= 3:
+            return results[:5]
+
+        # Source 4: Bitcoin Magazine RSS
+        results += await _fetch_rss_titles(c, "https://bitcoinmagazine.com/feed", "Bitcoin Magazine")
+        if len(results) >= 3:
+            return results[:5]
+
+        # Source 5: Google News RSS search for "cryptocurrency" — this is essentially
+        # Google's own crawled/aggregated headlines, very rarely down or rate-limited.
+        results += await _fetch_rss_titles(
+            c,
+            "https://news.google.com/rss/search?q=cryptocurrency+when:1d&hl=en-US&gl=US&ceid=US:en",
+            "Google News"
+        )
+        if len(results) >= 3:
+            return results[:5]
+
+        # Source 6: CoinGecko status updates (free, no key required)
+        try:
+            r = await c.get("https://api.coingecko.com/api/v3/status_updates", params={"per_page": 6})
             if r.status_code == 200:
                 data = r.json()
                 for item in data.get("status_updates", [])[:6]:
@@ -186,15 +260,14 @@ async def get_crypto_news():
                     if desc:
                         title = desc.strip().split("\n")[0][:100]
                         results.append({"title": title, "source": proj})
-    except Exception as e:
-        logging.warning(f"CoinGecko status_updates failed: {e}")
+        except Exception as e:
+            logging.warning(f"CoinGecko status_updates failed: {e}")
 
-    if len(results) >= 3:
-        return results[:5]
+        if len(results) >= 3:
+            return results[:5]
 
-    # Source 3: Reddit r/CryptoCurrency hot posts (free, no key required)
-    try:
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "cryptobot/1.0"}) as c:
+        # Source 6: Reddit r/CryptoCurrency hot posts (free, no key required)
+        try:
             r = await c.get("https://www.reddit.com/r/CryptoCurrency/hot.json?limit=6")
             if r.status_code == 200:
                 data = r.json()
@@ -202,8 +275,8 @@ async def get_crypto_news():
                     title = item.get("data", {}).get("title")
                     if title:
                         results.append({"title": title.strip(), "source": "r/CryptoCurrency"})
-    except Exception as e:
-        logging.warning(f"Reddit news failed: {e}")
+        except Exception as e:
+            logging.warning(f"Reddit news failed: {e}")
 
     return results[:5]
 
@@ -299,7 +372,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for i, coin in enumerate(trending, 1):
                 name = coin.get("item", {}).get("name", "Unknown")
                 symbol = coin.get("item", {}).get("symbol", "???").upper()
-                msg += f"{i}. *{name}* ({symbol})\n"
+                msg += f"{i}. *{safe_md(name)}* ({safe_md(symbol)})\n"
             await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
         else:
             await query.edit_message_text("❌ Could not fetch trending coins", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
@@ -311,7 +384,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if gainers:
             msg = "📈 *TOP GAINERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             for coin in gainers[:5]:
-                name = coin.get("name", "Unknown")
+                name = safe_md(coin.get("name", "Unknown"))
                 change = coin.get("price_change_percentage_24h", 0)
                 price = coin.get("current_price", 0)
                 msg += f"*{name}* — ${price:,.2f} ({change:+.2f}%)\n"
@@ -326,7 +399,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if losers:
             msg = "📉 *TOP LOSERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             for coin in losers[:5]:
-                name = coin.get("name", "Unknown")
+                name = safe_md(coin.get("name", "Unknown"))
                 change = coin.get("price_change_percentage_24h", 0)
                 price = coin.get("current_price", 0)
                 msg += f"*{name}* — ${price:,.2f} ({change:+.2f}%)\n"
@@ -345,11 +418,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 source = article.get("source", "")
                 if len(title) > 80:
                     title = title[:80] + "…"
-                msg += f"• {title}\n  _({source})_\n"
+                msg += f"• {safe_md(title)}\n  _({safe_md(source)})_\n"
             await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
         else:
             await query.edit_message_text(
-                "❌ Couldn't reach any news source right now (all 3 providers failed). Try again shortly.",
+                "❌ Couldn't reach any news source right now (all providers failed). Try again shortly.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]])
             )
 
@@ -394,7 +467,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "price":
         data = await get_crypto_price(text)
         if data:
-            msg = f"💰 *{data['symbol']}*\n"
+            msg = f"💰 *{safe_md(data['symbol'])}*\n"
             msg += f"Price: ${data['usd']:,.2f}\n"
             msg += f"GHS: ₵{data['ghs']:,.2f}\n"
             msg += f"24h Change: {data['change_24h']:+.2f}%\n"
@@ -410,69 +483,101 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # AUTO-POST JOB (Every 3 minutes)
 # ════════════════════════════════════════════════════════════════════════════════
 
+async def _build_trending_post() -> Optional[str]:
+    trending = await get_trending_coins()
+    if not trending:
+        return None
+    msg = "🔥 *TRENDING COINS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for i, coin in enumerate(trending[:3], 1):
+        name = safe_md(coin.get("item", {}).get("name", "Unknown"))
+        symbol = safe_md(coin.get("item", {}).get("symbol", "???").upper())
+        msg += f"{i}. *{name}* ({symbol})\n"
+    return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
+
+
+async def _build_gainers_post() -> Optional[str]:
+    gainers, _ = await get_top_gainers_losers()
+    if not gainers:
+        return None
+    msg = "📈 *TOP GAINERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for coin in gainers[:3]:
+        name = safe_md(coin.get("name", "Unknown"))
+        change = coin.get("price_change_percentage_24h", 0)
+        price = coin.get("current_price", 0)
+        msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
+    return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
+
+
+async def _build_losers_post() -> Optional[str]:
+    _, losers = await get_top_gainers_losers()
+    if not losers:
+        return None
+    msg = "📉 *TOP LOSERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for coin in losers[:3]:
+        name = safe_md(coin.get("name", "Unknown"))
+        change = coin.get("price_change_percentage_24h", 0)
+        price = coin.get("current_price", 0)
+        msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
+    return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
+
+
+async def _build_news_post() -> Optional[str]:
+    news = await get_crypto_news()
+    if not news:
+        return None
+    msg = "📰 *CRYPTO NEWS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for article in news[:3]:
+        title = article.get("title", "")
+        if len(title) > 70:
+            title = title[:70] + "…"
+        msg += f"• {safe_md(title)}\n"
+    return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
+
+
 async def auto_post_job(ctx: ContextTypes.DEFAULT_TYPE):
+    logging.info("auto_post_job: tick")
     channels = get_channels()
     if not channels:
+        logging.warning("auto_post_job: no registered channels, skipping")
         return
 
-    # Randomly choose what to post
-    post_type = random.choice(["trending", "gainers", "losers", "news"])
+    # Try categories in a random order, but fall through to the next one
+    # if a given category has no data, instead of giving up on the whole cycle.
+    builders = {
+        "trending": _build_trending_post,
+        "gainers": _build_gainers_post,
+        "losers": _build_losers_post,
+        "news": _build_news_post,
+    }
+    order = list(builders.keys())
+    random.shuffle(order)
+
     msg = None
+    used_type = None
+    for post_type in order:
+        try:
+            msg = await builders[post_type]()
+        except Exception as e:
+            logging.error(f"auto_post_job: error building post ({post_type}): {e}")
+            msg = None
+        if msg:
+            used_type = post_type
+            break
+        logging.warning(f"auto_post_job: no data for post_type={post_type}, trying next category")
 
-    if post_type == "trending":
-        trending = await get_trending_coins()
-        if trending:
-            msg = "🔥 *TRENDING COINS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            for i, coin in enumerate(trending[:3], 1):
-                name = coin.get("item", {}).get("name", "Unknown")
-                symbol = coin.get("item", {}).get("symbol", "???").upper()
-                msg += f"{i}. *{name}* ({symbol})\n"
-            msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-
-    elif post_type == "gainers":
-        gainers, _ = await get_top_gainers_losers()
-        if gainers:
-            msg = "📈 *TOP GAINERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            for coin in gainers[:3]:
-                name = coin.get("name", "Unknown")
-                change = coin.get("price_change_percentage_24h", 0)
-                price = coin.get("current_price", 0)
-                msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
-            msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-
-    elif post_type == "losers":
-        _, losers = await get_top_gainers_losers()
-        if losers:
-            msg = "📉 *TOP LOSERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            for coin in losers[:3]:
-                name = coin.get("name", "Unknown")
-                change = coin.get("price_change_percentage_24h", 0)
-                price = coin.get("current_price", 0)
-                msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
-            msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-
-    elif post_type == "news":
-        news = await get_crypto_news()
-        if news:
-            msg = "📰 *CRYPTO NEWS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            for article in news[:3]:
-                title = article.get("title", "")
-                if len(title) > 70:
-                    title = title[:70] + "…"
-                msg += f"• {title}\n"
-            msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-
-    # If the chosen category had no data (e.g. all news sources down), skip this cycle
     if not msg:
-        logging.warning(f"auto_post_job: no data for post_type={post_type}, skipping this cycle")
+        logging.error("auto_post_job: ALL categories returned no data this cycle (likely a network/egress issue)")
         return
+
+    logging.info(f"auto_post_job: posting type={used_type} to {len(channels)} channel(s)")
 
     # Send to all channels
     for cid in channels:
         try:
             await ctx.bot.send_message(int(cid), msg, parse_mode="Markdown")
+            logging.info(f"auto_post_job: successfully posted to chat_id={cid}")
         except Exception as e:
-            logging.error(f"Post failed: {e}")
+            logging.error(f"auto_post_job: send FAILED for chat_id={cid}: {e}")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # CHAT MEMBERSHIP
@@ -486,6 +591,7 @@ async def track_chat_membership(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = cmu.new_chat_member.status
     if status in ("administrator", "creator"):
         register_channel(chat.id, chat.title or chat.username, chat.type)
+        logging.info(f"Registered channel: {chat.id} ({chat.title})")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -499,7 +605,18 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(ChatMemberHandler(track_chat_membership, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    app.job_queue.run_repeating(auto_post_job, interval=timedelta(minutes=3))
+    if app.job_queue is None:
+        # This happens if `python-telegram-bot[job-queue]` extra isn't installed.
+        # Without it, scheduled jobs (including auto_post_job) silently never run.
+        logging.error(
+            "JobQueue is not available! Install with: "
+            "pip install \"python-telegram-bot[job-queue]\". "
+            "Auto-posting will NOT work until this is fixed."
+        )
+    else:
+        # `first=10` makes it post ~10s after startup instead of waiting
+        # a full 3 minutes for the first post, so you can verify it's alive.
+        app.job_queue.run_repeating(auto_post_job, interval=timedelta(minutes=3), first=10)
 
     logging.info("🚀 CryptoBot starting...")
     app.run_polling()
