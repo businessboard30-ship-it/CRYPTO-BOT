@@ -14,6 +14,7 @@ import logging
 import random
 import io
 import re
+import asyncio
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -30,6 +31,11 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, filters, ChatMemberHandler
 )
 
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
 logging.basicConfig(level=logging.INFO)
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -39,6 +45,11 @@ logging.basicConfig(level=logging.INFO)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PAYSTACK_SECRET = os.environ.get("PAYSTACK_SECRET")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+groq_client = Groq(api_key=GROQ_API_KEY) if (Groq and GROQ_API_KEY) else None
+if not groq_client:
+    logging.warning("GROQ_API_KEY not set or groq package missing — AI summaries will be skipped.")
 
 DATA_DIR = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -280,6 +291,42 @@ async def get_crypto_news():
 
     return results[:5]
 
+
+async def get_ai_summary(context_text: str) -> Optional[str]:
+    """Ask Groq's Llama model for a short, clearly-labeled market take based on
+    real data we already fetched. Returns None if Groq isn't configured or fails
+    — callers should treat this as optional extra color, never required content.
+    """
+    if not groq_client:
+        return None
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                groq_client.chat.completions.create,
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a crypto market commentator. Given real market data, "
+                            "write ONE short, plain-English sentence (max 25 words) of context "
+                            "or interpretation. Be factual and measured — no hype, no financial "
+                            "advice, no price predictions. Do not invent numbers not given to you."
+                        ),
+                    },
+                    {"role": "user", "content": context_text},
+                ],
+                max_tokens=80,
+                temperature=0.5,
+            ),
+            timeout=15,
+        )
+        text = resp.choices[0].message.content.strip()
+        return safe_md(text)
+    except Exception as e:
+        logging.warning(f"Groq AI summary failed: {e}")
+        return None
+
 # ════════════════════════════════════════════════════════════════════════════════
 # CHART GENERATION
 # ════════════════════════════════════════════════════════════════════════════════
@@ -487,11 +534,16 @@ async def _build_trending_post() -> Optional[str]:
     trending = await get_trending_coins()
     if not trending:
         return None
+    names = []
     msg = "🔥 *TRENDING COINS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for i, coin in enumerate(trending[:3], 1):
-        name = safe_md(coin.get("item", {}).get("name", "Unknown"))
-        symbol = safe_md(coin.get("item", {}).get("symbol", "???").upper())
-        msg += f"{i}. *{name}* ({symbol})\n"
+        raw_name = coin.get("item", {}).get("name", "Unknown")
+        raw_symbol = coin.get("item", {}).get("symbol", "???").upper()
+        names.append(f"{raw_name} ({raw_symbol})")
+        msg += f"{i}. *{safe_md(raw_name)}* ({safe_md(raw_symbol)})\n"
+    ai_note = await get_ai_summary(f"Currently trending on CoinGecko: {', '.join(names)}.")
+    if ai_note:
+        msg += f"\n🤖 _AI take: {ai_note}_\n"
     return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
 
 
@@ -499,12 +551,17 @@ async def _build_gainers_post() -> Optional[str]:
     gainers, _ = await get_top_gainers_losers()
     if not gainers:
         return None
+    facts = []
     msg = "📈 *TOP GAINERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for coin in gainers[:3]:
-        name = safe_md(coin.get("name", "Unknown"))
+        raw_name = coin.get("name", "Unknown")
         change = coin.get("price_change_percentage_24h", 0)
         price = coin.get("current_price", 0)
-        msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
+        facts.append(f"{raw_name} +{change:.1f}% at ${price:,.2f}")
+        msg += f"*{safe_md(raw_name)}* → ${price:,.2f} ({change:+.2f}%)\n"
+    ai_note = await get_ai_summary(f"Top 24h gainers: {'; '.join(facts)}.")
+    if ai_note:
+        msg += f"\n🤖 _AI take: {ai_note}_\n"
     return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
 
 
@@ -512,12 +569,17 @@ async def _build_losers_post() -> Optional[str]:
     _, losers = await get_top_gainers_losers()
     if not losers:
         return None
+    facts = []
     msg = "📉 *TOP LOSERS (24h)*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for coin in losers[:3]:
-        name = safe_md(coin.get("name", "Unknown"))
+        raw_name = coin.get("name", "Unknown")
         change = coin.get("price_change_percentage_24h", 0)
         price = coin.get("current_price", 0)
-        msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
+        facts.append(f"{raw_name} {change:.1f}% at ${price:,.2f}")
+        msg += f"*{safe_md(raw_name)}* → ${price:,.2f} ({change:+.2f}%)\n"
+    ai_note = await get_ai_summary(f"Top 24h losers: {'; '.join(facts)}.")
+    if ai_note:
+        msg += f"\n🤖 _AI take: {ai_note}_\n"
     return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
 
 
@@ -525,12 +587,17 @@ async def _build_news_post() -> Optional[str]:
     news = await get_crypto_news()
     if not news:
         return None
+    headlines = []
     msg = "📰 *CRYPTO NEWS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for article in news[:3]:
         title = article.get("title", "")
+        headlines.append(title)
         if len(title) > 70:
             title = title[:70] + "…"
         msg += f"• {safe_md(title)}\n"
+    ai_note = await get_ai_summary("Recent crypto headlines: " + " | ".join(headlines))
+    if ai_note:
+        msg += f"\n🤖 _AI take: {ai_note}_\n"
     return msg + "\n⏰ " + datetime.now().strftime("%H:%M UTC")
 
 
