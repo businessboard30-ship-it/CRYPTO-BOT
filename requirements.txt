@@ -3,3 +3,4 @@ httpx
 yfinance
 matplotlib
 pillow
+groq
