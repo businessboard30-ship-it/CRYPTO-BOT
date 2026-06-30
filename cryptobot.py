@@ -1,7 +1,7 @@
 """
 🚀 CryptoBot — Professional Crypto Analysis Bot
 - Real market data posts (trending coins, top gainers/losers)
-- Live cryptocurrency news
+- Live cryptocurrency news (multi-source with fallback)
 - Generated charts and graphs
 - Price lookups with full details
 - Premium tier GHS 50/month
@@ -150,14 +150,62 @@ async def get_crypto_price(symbol: str) -> Dict:
     return None
 
 async def get_crypto_news():
-    """Get crypto news"""
+    """Get crypto news from multiple sources, falling back if one fails.
+    Returns a list of dicts: {"title": str, "source": str}
+    """
+    results = []
+
+    # Source 1: CryptoCompare news (free, no key required, generous rate limit)
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get("https://cryptopanic.com/api/v1/posts/", params={"auth_token": "free", "currencies": "BTC"}, timeout=10)
-            data = r.json()
-            return data.get("results", [])[:3]
-    except:
-        return []
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
+            if r.status_code == 200:
+                data = r.json()
+                for item in data.get("Data", [])[:6]:
+                    title = item.get("title")
+                    if title:
+                        results.append({"title": title.strip(), "source": item.get("source_info", {}).get("name") or item.get("source", "CryptoCompare")})
+    except Exception as e:
+        logging.warning(f"CryptoCompare news failed: {e}")
+
+    if len(results) >= 3:
+        return results[:5]
+
+    # Source 2: CoinGecko status updates (free, no key required)
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                "https://api.coingecko.com/api/v3/status_updates",
+                params={"per_page": 6}
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for item in data.get("status_updates", [])[:6]:
+                    desc = item.get("description")
+                    proj = (item.get("project") or {}).get("name", "CoinGecko")
+                    if desc:
+                        title = desc.strip().split("\n")[0][:100]
+                        results.append({"title": title, "source": proj})
+    except Exception as e:
+        logging.warning(f"CoinGecko status_updates failed: {e}")
+
+    if len(results) >= 3:
+        return results[:5]
+
+    # Source 3: Reddit r/CryptoCurrency hot posts (free, no key required)
+    try:
+        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "cryptobot/1.0"}) as c:
+            r = await c.get("https://www.reddit.com/r/CryptoCurrency/hot.json?limit=6")
+            if r.status_code == 200:
+                data = r.json()
+                for item in data.get("data", {}).get("children", [])[:6]:
+                    title = item.get("data", {}).get("title")
+                    if title:
+                        results.append({"title": title.strip(), "source": "r/CryptoCurrency"})
+    except Exception as e:
+        logging.warning(f"Reddit news failed: {e}")
+
+    return results[:5]
 
 # ════════════════════════════════════════════════════════════════════════════════
 # CHART GENERATION
@@ -170,10 +218,10 @@ async def generate_price_chart(ticker: str, period: str = "1mo") -> Optional[str
         hist = stock.history(period=period)
         if hist.empty:
             return None
-        
+
         fig, ax = plt.subplots(figsize=(12, 6), facecolor='#1a1a1a')
         ax.set_facecolor('#2d2d2d')
-        
+
         width = 0.6
         for i, (idx, row) in enumerate(hist.iterrows()):
             open_p, high, low, close = row['Open'], row['High'], row['Low'], row['Close']
@@ -184,13 +232,13 @@ async def generate_price_chart(ticker: str, period: str = "1mo") -> Optional[str
             from matplotlib.patches import Rectangle
             rect = Rectangle((i - width/2, rect_y), width, rect_height, facecolor=color, edgecolor=color)
             ax.add_patch(rect)
-        
+
         ax.set_xlim(-1, len(hist))
         ax.set_ylim(hist['Low'].min() * 0.95, hist['High'].max() * 1.05)
         ax.set_title(f"{ticker.upper()} — {period}", color='white', fontsize=14, fontweight='bold')
         ax.tick_params(colors='white')
         ax.grid(True, alpha=0.2)
-        
+
         path = f"/tmp/chart_{ticker}.png"
         plt.savefig(path, bbox_inches='tight', facecolor='#1a1a1a', dpi=100)
         plt.close()
@@ -227,10 +275,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     uid = update.effective_user.id
     data = query.data
-    
+
     # GET PRICE
     if data == "m_price":
         await query.edit_message_text(
@@ -241,7 +289,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         ctx.user_data["mode"] = "price"
-    
+
     # TRENDING
     elif data == "m_trending":
         await query.edit_message_text("⏳ Loading trending coins...")
@@ -255,7 +303,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
         else:
             await query.edit_message_text("❌ Could not fetch trending coins", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
-    
+
     # TOP GAINERS
     elif data == "m_gainers":
         await query.edit_message_text("⏳ Loading top gainers...")
@@ -270,7 +318,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
         else:
             await query.edit_message_text("❌ Could not fetch gainers", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
-    
+
     # TOP LOSERS
     elif data == "m_losers":
         await query.edit_message_text("⏳ Loading top losers...")
@@ -285,20 +333,26 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
         else:
             await query.edit_message_text("❌ Could not fetch losers", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
-    
+
     # NEWS
     elif data == "m_news":
         await query.edit_message_text("⏳ Loading crypto news...")
         news = await get_crypto_news()
         if news:
             msg = "📰 *CRYPTO NEWS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            for article in news[:3]:
-                title = article.get("title", "No title")[:50]
-                msg += f"• {title}...\n"
+            for article in news[:5]:
+                title = article.get("title", "No title")
+                source = article.get("source", "")
+                if len(title) > 80:
+                    title = title[:80] + "…"
+                msg += f"• {title}\n  _({source})_\n"
             await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
         else:
-            await query.edit_message_text("❌ Could not fetch news", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]))
-    
+            await query.edit_message_text(
+                "❌ Couldn't reach any news source right now (all 3 providers failed). Try again shortly.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]])
+            )
+
     # PREMIUM
     elif data == "m_premium":
         await query.edit_message_text(
@@ -310,7 +364,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ BACK", callback_data="home")]]),
             parse_mode="Markdown"
         )
-    
+
     # HOME
     elif data == "home":
         await query.edit_message_text(
@@ -336,7 +390,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
     mode = ctx.user_data.get("mode")
-    
+
     if mode == "price":
         data = await get_crypto_price(text)
         if data:
@@ -360,10 +414,11 @@ async def auto_post_job(ctx: ContextTypes.DEFAULT_TYPE):
     channels = get_channels()
     if not channels:
         return
-    
+
     # Randomly choose what to post
     post_type = random.choice(["trending", "gainers", "losers", "news"])
-    
+    msg = None
+
     if post_type == "trending":
         trending = await get_trending_coins()
         if trending:
@@ -373,7 +428,7 @@ async def auto_post_job(ctx: ContextTypes.DEFAULT_TYPE):
                 symbol = coin.get("item", {}).get("symbol", "???").upper()
                 msg += f"{i}. *{name}* ({symbol})\n"
             msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-    
+
     elif post_type == "gainers":
         gainers, _ = await get_top_gainers_losers()
         if gainers:
@@ -384,7 +439,7 @@ async def auto_post_job(ctx: ContextTypes.DEFAULT_TYPE):
                 price = coin.get("current_price", 0)
                 msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
             msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-    
+
     elif post_type == "losers":
         _, losers = await get_top_gainers_losers()
         if losers:
@@ -395,16 +450,23 @@ async def auto_post_job(ctx: ContextTypes.DEFAULT_TYPE):
                 price = coin.get("current_price", 0)
                 msg += f"*{name}* → ${price:,.2f} ({change:+.2f}%)\n"
             msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-    
+
     elif post_type == "news":
         news = await get_crypto_news()
         if news:
             msg = "📰 *CRYPTO NEWS*\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            for article in news[:2]:
-                title = article.get("title", "")[:60]
+            for article in news[:3]:
+                title = article.get("title", "")
+                if len(title) > 70:
+                    title = title[:70] + "…"
                 msg += f"• {title}\n"
             msg += "\n⏰ " + datetime.now().strftime("%H:%M UTC")
-    
+
+    # If the chosen category had no data (e.g. all news sources down), skip this cycle
+    if not msg:
+        logging.warning(f"auto_post_job: no data for post_type={post_type}, skipping this cycle")
+        return
+
     # Send to all channels
     for cid in channels:
         try:
@@ -431,14 +493,14 @@ async def track_chat_membership(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(ChatMemberHandler(track_chat_membership, ChatMemberHandler.MY_CHAT_MEMBER))
-    
+
     app.job_queue.run_repeating(auto_post_job, interval=timedelta(minutes=3))
-    
+
     logging.info("🚀 CryptoBot starting...")
     app.run_polling()
 
